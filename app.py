@@ -1,0 +1,236 @@
+import io
+import re
+import zipfile
+from datetime import date
+from pathlib import Path
+
+import streamlit as st
+from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+APP_DIR = Path(__file__).resolve().parent
+TEMPLATE_PATH = APP_DIR / "template_ranking.pptx"
+
+CATEGORIES = [
+    "GLOBAL", "BLAZER", "DRESS", "JACKET", "KNITWEAR", "PANTS",
+    "SHIRT", "SHORT", "SKIRT", "VEST", "DENIM PANTS", "SKIRT (PAGE 2)"
+]
+# 0-based slide indexes in the user's 26-slide template.
+DISPLAY_SLIDE_INDEX = {
+    "GLOBAL": 2, "BLAZER": 4, "DRESS": 6, "JACKET": 8,
+    "KNITWEAR": 10, "PANTS": 12, "SHIRT": 14, "SHORT": 16,
+    "SKIRT": 18, "VEST": 20, "DENIM PANTS": 22, "SKIRT (PAGE 2)": 24
+}
+SLOT_X_BY_RANK = [0.93, 3.24, 5.62, 7.99, 10.32, 0.92, 3.23, 5.61, 7.99, 10.31]
+SLOT_Y = [1.35, 1.36, 1.36, 1.36, 1.37, 4.28, 4.28, 4.28, 4.28, 4.29]
+PHOTO_W, PHOTO_H = 1.63, 2.17
+PHOTO_INSET_X, PHOTO_INSET_Y = 0.20, 0.08
+
+def format_period(start, end):
+    if start.year == end.year and start.month == end.month:
+        return f"{start.day} – {end.day} {end.strftime('%b').upper()} {end.year}"
+    if start.year == end.year:
+        return f"{start.day} {start.strftime('%b').upper()} – {end.day} {end.strftime('%b').upper()} {end.year}"
+    return f"{start.day} {start.strftime('%b').upper()} {start.year} – {end.day} {end.strftime('%b').upper()} {end.year}"
+
+def make_photo_bytes(raw):
+    with Image.open(io.BytesIO(raw)) as original:
+        im = original.convert("RGB")
+    target_ratio = PHOTO_W / PHOTO_H
+    w, h = im.size
+    if w / h > target_ratio:
+        new_w = max(1, int(h * target_ratio))
+        left = (w - new_w) // 2
+        im = im.crop((left, 0, left + new_w, h))
+    else:
+        new_h = max(1, int(w / target_ratio))
+        top = (h - new_h) // 2
+        im = im.crop((0, top, w, top + new_h))
+    out = io.BytesIO()
+    im.save(out, format="JPEG", quality=92, optimize=True)
+    out.seek(0)
+    return out
+
+def clear_status_textboxes(slide, rank):
+    slot = rank - 1
+    x0, y0 = SLOT_X_BY_RANK[slot], SLOT_Y[slot]
+    allowed = {"√", "No stock", "NO STOCK", "LP", "LAST PIECES"}
+    for shape in slide.shapes:
+        if not getattr(shape, "has_text_frame", False) or shape.text.strip() not in allowed:
+            continue
+        sx, sy = shape.left / 914400, shape.top / 914400
+        if abs(sx - (x0 + PHOTO_INSET_X)) < 0.35 and abs(sy - (y0 + PHOTO_INSET_Y)) < 0.35:
+            shape.text_frame.clear()
+
+def insert_photo_for_rank(slide, photo_stream, rank):
+    slot = rank - 1
+    left = Inches(SLOT_X_BY_RANK[slot] + PHOTO_INSET_X)
+    top = Inches(SLOT_Y[slot] + PHOTO_INSET_Y)
+    width, height = Inches(PHOTO_W), Inches(PHOTO_H)
+    right, bottom = left + width, top + height
+
+    # Remove any existing template picture whose center lies in this rank slot.
+    # Standard python-pptx shape operations keep the PPTX package structure valid.
+    for shape in list(slide.shapes):
+        if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+            continue
+        cx = shape.left + shape.width / 2
+        cy = shape.top + shape.height / 2
+        if left <= cx <= right and top <= cy <= bottom:
+            slide.shapes._spTree.remove(shape._element)
+
+    photo_stream.seek(0)
+    slide.shapes.add_picture(photo_stream, left, top, width=width, height=height)
+
+def generate_pptx(entries):
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError("File template_ranking.pptx tidak ditemukan di folder aplikasi.")
+    # Every report starts from a fresh copy of the unchanged original template.
+    prs = Presentation(str(TEMPLATE_PATH))
+    if len(prs.slides) < 25:
+        raise ValueError(f"Template harus memiliki minimal 25 slide; ditemukan {len(prs.slides)}.")
+    date_text = entries[0]["date"] if entries else format_period(date(2026, 10, 19), date(2026, 10, 25))
+    for slide in prs.slides:
+        for sh in slide.shapes:
+            if getattr(sh, "has_text_frame", False) and re.search(r"\bOCT\s+2026\b", sh.text, flags=re.I):
+                p = sh.text_frame.paragraphs[0]
+                if p.runs:
+                    p.runs[0].text = date_text
+                    for run in p.runs[1:]:
+                        run.text = ""
+                else:
+                    sh.text_frame.text = date_text
+    for entry in entries:
+        slide = prs.slides[DISPLAY_SLIDE_INDEX[entry["category"]]]
+        clear_status_textboxes(slide, int(entry["rank"]))
+        insert_photo_for_rank(slide, make_photo_bytes(entry["display_bytes"]), int(entry["rank"]))
+    out = io.BytesIO()
+    prs.save(out)
+    data = out.getvalue()
+    # Validate the resulting file before offering it for download.
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        bad = zf.testzip()
+        if bad:
+            raise ValueError(f"File PowerPoint tidak valid pada bagian: {bad}")
+    # Ensure python-pptx can reopen the exact generated bytes.
+    Presentation(io.BytesIO(data))
+    return data
+
+st.set_page_config(page_title="Ranking Position Ladies - Festival Citylink", page_icon="📸", layout="wide")
+st.title("RANKING POSITION LADIES — FESTIVAL CITYLINK")
+st.caption("Pilih foto display, tentukan kategori dan ranking, lalu buat PowerPoint dari template terbaru.")
+
+if "entries" not in st.session_state:
+    st.session_state.entries = []
+if "generated_pptx" not in st.session_state:
+    st.session_state.generated_pptx = None
+if "generated_name" not in st.session_state:
+    st.session_state.generated_name = None
+
+with st.container(border=True):
+    st.subheader("Laporan mingguan")
+    st.write("Setiap PowerPoint dibuat dari template asli yang bersih. Setelah pembuatan berhasil, daftar foto input dikosongkan otomatis.")
+    d1, d2 = st.columns(2)
+    with d1:
+        start_date = st.date_input("Tanggal mulai laporan", value=date.today(), format="DD/MM/YYYY", key="start_date")
+    with d2:
+        end_date = st.date_input("Tanggal akhir laporan", value=date.today(), format="DD/MM/YYYY", key="end_date")
+    if end_date < start_date:
+        st.error("Tanggal akhir tidak boleh lebih awal dari tanggal mulai.")
+    date_label = format_period(start_date, end_date) if end_date >= start_date else ""
+
+with st.expander("1. Pilih foto PICT referensi (opsional)", expanded=False):
+    st.write("PICT hanya untuk referensi. Bisa pilih beberapa gambar dari komputer atau Google Drive yang sudah tersinkron.")
+    pict_files = st.file_uploader("Upload gambar PICT", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key="pict_upload")
+    pict_names = [f.name for f in pict_files] if pict_files else []
+    selected_pict = st.selectbox("PICT referensi", ["(Tidak memilih PICT)"] + pict_names)
+    pict_bytes = next((f.getvalue() for f in pict_files if f.name == selected_pict), None) if selected_pict != "(Tidak memilih PICT)" else None
+
+st.divider()
+st.subheader("2. Input foto display")
+left, right = st.columns([1, 1])
+with left:
+    category = st.selectbox("Kategori", CATEGORIES)
+    rank = st.selectbox("Ranking Position", list(range(1, 11)), format_func=lambda x: f"RK {x}")
+    article = st.text_input("Kode/nama artikel (opsional)", placeholder="Masukkan kode artikel jika diperlukan")
+with right:
+    camera_photo = st.camera_input("Ambil foto display dengan kamera", key="camera_display")
+    uploaded_photo = st.file_uploader("Atau pilih foto dari perangkat", type=["jpg", "jpeg", "png", "webp"], key="display_upload")
+    display_photo = camera_photo if camera_photo is not None else uploaded_photo
+    if display_photo is not None:
+        st.image(display_photo, caption="Foto display yang akan dimasukkan", width="stretch")
+
+if st.button("Simpan foto ke daftar ranking", type="primary", width="stretch"):
+    if end_date < start_date:
+        st.error("Perbaiki periode tanggal terlebih dahulu.")
+    elif display_photo is None:
+        st.error("Ambil foto atau pilih file foto display terlebih dahulu.")
+    else:
+        existing = next((e for e in st.session_state.entries if e["category"] == category and e["rank"] == rank), None)
+        if existing:
+            st.error(f"Slot {category} — RK {rank} sudah terisi. Hapus slot sebelumnya jika ingin menggantinya.")
+        else:
+            st.session_state.entries.append({
+                "date": date_label, "category": category, "rank": rank,
+                "article": article.strip(), "pict_name": selected_pict if selected_pict != "(Tidak memilih PICT)" else "",
+                "pict_bytes": pict_bytes, "display_name": getattr(display_photo, "name", f"camera_{category}_{rank}.jpg"),
+                "display_bytes": display_photo.getvalue()
+            })
+            st.success(f"Tersimpan: {category} — RK {rank} ({date_label}).")
+            st.rerun()
+
+st.divider()
+st.subheader("3. Daftar foto ranking")
+if not st.session_state.entries:
+    st.info("Daftar foto kosong dan siap untuk laporan baru.")
+else:
+    for e in list(sorted(st.session_state.entries, key=lambda x: (CATEGORIES.index(x["category"]), x["rank"]))):
+        c1, c2, c3 = st.columns([1, 3, 1])
+        with c1:
+            st.image(e["display_bytes"], width=110)
+        with c2:
+            st.write(f"**{e['category']} — RK {e['rank']}**")
+            st.caption(f"Periode: {e['date']} · Artikel: {e['article'] or '—'} · PICT: {e['pict_name'] or '—'}")
+        with c3:
+            if st.button("Hapus", key=f"delete_{e['category']}_{e['rank']}"):
+                st.session_state.entries = [x for x in st.session_state.entries if not (x["category"] == e["category"] and x["rank"] == e["rank"])]
+                st.rerun()
+
+if st.session_state.entries:
+    if st.button("BUAT POWERPOINT & KOSONGKAN DAFTAR", type="primary", width="stretch"):
+        try:
+            data = generate_pptx(st.session_state.entries)
+            st.session_state.generated_pptx = data
+            st.session_state.generated_name = f"RANKING_POSITION_LADIES_FESTIVAL_CITYLINK_{date.today():%Y%m%d}.pptx"
+            st.session_state.entries = []
+            st.success("PowerPoint berhasil dibuat dan lolos pemeriksaan file. Daftar input sudah dikosongkan otomatis.")
+            st.rerun()
+        except Exception as ex:
+            st.error(f"Gagal membuat PowerPoint: {ex}")
+            st.caption("Template asli tidak diubah. Perbaiki error sebelum mencoba kembali.")
+
+if st.session_state.generated_pptx:
+    st.subheader("4. PowerPoint siap diunduh")
+    st.download_button(
+        "Download PowerPoint (.pptx)",
+        data=st.session_state.generated_pptx,
+        file_name=st.session_state.generated_name or "RANKING_POSITION_LADIES.pptx",
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        width="stretch"
+    )
+    if st.button("Tutup hasil unduhan", key="clear_generated"):
+        st.session_state.generated_pptx = None
+        st.session_state.generated_name = None
+        st.rerun()
+
+with st.expander("Catatan"):
+    st.markdown("""
+- Template PowerPoint yang digunakan adalah file terbaru yang disertakan dalam paket.
+- Setiap pembuatan laporan dimulai dari template asli yang bersih, sehingga foto dari laporan sebelumnya tidak terbawa.
+- Setelah pembuatan PowerPoint berhasil, daftar foto input dikosongkan otomatis.
+- 12 kategori, termasuk DENIM PANTS dan halaman SKIRT kedua, mengikuti susunan template 26 slide.
+- Foto PICT hanya referensi; foto display yang diunggah adalah foto yang dimasukkan ke slide.
+- Aplikasi tidak menyimpan foto ke database. Data input berada pada sesi aplikasi.
+""")
