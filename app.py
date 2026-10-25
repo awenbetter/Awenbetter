@@ -6,6 +6,7 @@ import streamlit as st
 from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 APP_DIR = Path(__file__).parent
 TEMPLATE_PATH = APP_DIR / "template_ranking.pptx"
@@ -144,27 +145,29 @@ def clear_status_textboxes(slide, rank):
 
 
 def insert_photo_under_overlays(slide, photo_stream, rank):
+    """Replace any existing template photo in this ranking slot with the uploaded photo."""
     slot = rank - 1
     x0, y0 = SLOT_X_BY_RANK[slot], SLOT_Y[slot]
-    pic = slide.shapes.add_picture(photo_stream, Inches(x0 + PHOTO_INSET_X), Inches(y0 + PHOTO_INSET_Y), Inches(PHOTO_W), Inches(PHOTO_H))
-    sp_tree = slide.shapes._spTree
-    sp_tree.remove(pic._element)
-    insert_at = len(sp_tree)
-    for i, child in enumerate(sp_tree):
-        tag = child.tag.split('}')[-1]
-        if tag in ("sp", "graphicFrame", "cxnSp"):
-            nv = child.find('.//{http://schemas.openxmlformats.org/presentationml/2006/main}cNvPr')
-            name = nv.get('name', '') if nv is not None else ''
-            if name.startswith("object"):
-                try:
-                    off = child.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}off')
-                    x, y = int(off.get('x')) / 914400, int(off.get('y')) / 914400
-                    if abs(x - x0) < 0.18 and abs(y - y0) < 0.18 and tag == 'sp':
-                        insert_at = i
-                        break
-                except Exception:
-                    pass
-    sp_tree.insert(insert_at, pic._element)
+    left = Inches(x0 + PHOTO_INSET_X)
+    top = Inches(y0 + PHOTO_INSET_Y)
+    width = Inches(PHOTO_W)
+    height = Inches(PHOTO_H)
+
+    # Remove only existing pictures whose center falls inside this slot.
+    # This prevents old/sample template photos from covering the newly uploaded photo.
+    slot_left, slot_top = left, top
+    slot_right, slot_bottom = left + width, top + height
+    for shape in list(slide.shapes):
+        if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+            continue
+        center_x = shape.left + shape.width / 2
+        center_y = shape.top + shape.height / 2
+        if slot_left <= center_x <= slot_right and slot_top <= center_y <= slot_bottom:
+            slide.shapes._spTree.remove(shape._element)
+
+    # Add the uploaded photo last so it appears above old template imagery.
+    # Status text for this slot is cleared separately before this function runs.
+    slide.shapes.add_picture(photo_stream, left, top, width=width, height=height)
 
 
 def generate_pptx(entries):
@@ -185,10 +188,15 @@ def generate_pptx(entries):
         slide = prs.slides[DISPLAY_SLIDE_INDEX[entry["category"]]]
         clear_status_textboxes(slide, entry["rank"])
         insert_photo_under_overlays(slide, make_photo_bytes(entry["display_bytes"]), entry["rank"])
+    # Save to memory, then validate that the generated PPTX can be reopened.
     out = io.BytesIO()
     prs.save(out)
-    out.seek(0)
-    return out
+    generated_bytes = out.getvalue()
+    try:
+        Presentation(io.BytesIO(generated_bytes))
+    except Exception as exc:
+        raise RuntimeError(f"File PowerPoint hasil generate tidak valid: {exc}") from exc
+    return io.BytesIO(generated_bytes)
 
 if st.session_state.entries:
     st.divider()
