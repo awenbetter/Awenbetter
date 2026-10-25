@@ -6,6 +6,19 @@ import streamlit as st
 from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches
+import threading
+from streamlit_webrtc import webrtc_streamer
+
+# Menyimpan frame kamera terbaru sementara
+_latest_frame = {"image": None}
+_frame_lock = threading.Lock()
+
+
+def camera_frame_callback(frame):
+    image = frame.to_ndarray(format="rgb24")
+    with _frame_lock:
+        _latest_frame["image"] = image
+    return frame
 
 APP_DIR = Path(__file__).parent
 TEMPLATE_PATH = APP_DIR / "template_ranking.pptx"
@@ -67,12 +80,51 @@ with left:
     article = st.text_input("Kode/nama artikel (opsional)", placeholder="Masukkan artikel jika diperlukan")
     selected_pict = st.selectbox("Pilih PICT referensi", pict_names) if pict_names else None
 with right:
+   
     st.write("**Foto display asli**")
-    camera_photo = st.camera_input("Ambil foto display dengan kamera")
-    uploaded_photo = st.file_uploader("Atau pilih foto display dari perangkat", type=["jpg", "jpeg", "png", "webp"], key="display_upload")
-    display_photo = camera_photo or uploaded_photo
+
+    webrtc_streamer(
+        key="display_camera",
+        video_frame_callback=camera_frame_callback,
+        media_stream_constraints={
+            "video": {"facingMode": "environment"},
+            "audio": False,
+        },
+        async_processing=True,
+    )
+
+    if st.button("Ambil foto dari kamera belakang", key="capture_display_photo"):
+        with _frame_lock:
+            latest = _latest_frame["image"]
+            captured = latest.copy() if latest is not None else None
+
+        if captured is not None:
+            buffer = io.BytesIO()
+            Image.fromarray(captured).save(buffer, format="JPEG", quality=90)
+            st.session_state["display_camera_photo"] = buffer.getvalue()
+            st.success("Foto berhasil diambil.")
+        else:
+            st.warning("Kamera belum siap. Tunggu sampai gambar muncul.")
+
+    uploaded_photo = st.file_uploader(
+        "Atau pilih foto display dari perangkat",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="display_upload",
+    )
+
+    if uploaded_photo:
+        display_photo = uploaded_photo
+    else:
+        saved_photo = st.session_state.get("display_camera_photo")
+        display_photo = io.BytesIO(saved_photo) if saved_photo else None
+
     if display_photo:
-        st.image(display_photo, caption="Foto display asli yang akan masuk ke PowerPoint", width="stretch")
+        st.image(
+            display_photo,
+            caption="Foto display asli yang akan masuk ke PowerPoint",
+            width="stretch",
+        )
+
 
 if st.button("Simpan foto ke daftar ranking", type="primary", width="stretch"):
     if end_date < start_date:
